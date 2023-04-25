@@ -64,6 +64,10 @@ class SDFFeatures :
       const Identity &_parentID,
       const ::sdf::Model &_sdfModel) override;
 
+  public: Identity ConstructSdfSoftBodyLink(
+      const Identity &_modelID,
+      const ::sdf::Link &_sdfLink);
+
   public: Identity ConstructSdfLink(
       const Identity &_modelID,
       const ::sdf::Link &_sdfLink) override;
