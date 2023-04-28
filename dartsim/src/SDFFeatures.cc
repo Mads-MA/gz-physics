@@ -39,6 +39,7 @@
 #include <dart/dynamics/UniversalJoint.hpp>
 #include <dart/constraint/WeldJointConstraint.hpp>
 #include <dart/dynamics/WeldJoint.hpp>
+#include <dart/math/MathTypes.hpp>
 
 #include <gz/common/Console.hh>
 #include <gz/common/Mesh.hh>
@@ -253,6 +254,7 @@ struct ShapeAndTransform
 static ShapeAndTransform ConstructBox(
     const ::sdf::Box &_box)
 {
+
   return {std::make_shared<dart::dynamics::BoxShape>(
         math::eigen3::convert(_box.Size()))};
 }
@@ -605,185 +607,132 @@ Identity SDFFeatures::ConstructSdfModelImpl(
 }
 
 /////////////////////////////////////////////////
-Identity SDFFeatures::ConstructSdfSoftBodyLink(
-    const Identity &_modelID,
-    const ::sdf::Link &_sdfLink)
-{
-  const auto &modelInfo = *this->ReferenceInterface<ModelInfo>(_modelID);
-
-  dart::dynamics::SoftBodyNode::UniqueProperties softProperties;
-
-  //We only support 1 collision element when soft body is enabled
-  if (_sdfLink.CollisionCount() > 1) {
-    ignerr << "When parsing soft body for model ["<< modelInfo.model->getName() 
-          << "] only expected 1 collision element, but found " << _sdfLink.CollisionCount() << "\n";
-          return this->GenerateInvalidId(); 
-  }
-  
-  auto collision = _sdfLink.CollisionByIndex(0);
-  auto collGeo = collision->Geom();
-  double mass = _sdfLink.Inertial().MassMatrix().Mass();
-
-  //Parse shape. Only box, cylinder and ellipsoid is allowed. Throw warning otherwise.
-  if (collGeo->BoxShape())
-  {
-    auto boxShape = collGeo->BoxShape();
-    Eigen::Vector3d size(
-      boxShape->Size().X(),
-      boxShape->Size().Y(),
-      boxShape->Size().Z()
-      );
-
-    softProperties = dart::dynamics::SoftBodyNodeHelper::makeBoxProperties(
-      size,
-      Eigen::Isometry3d::Identity(),
-      mass
-    );
-  } 
-  else if (collGeo->CylinderShape()) 
-  {
-    auto cylinderShape = collGeo->CylinderShape();
-
-    softProperties = dart::dynamics::SoftBodyNodeHelper::makeCylinderProperties(
-      cylinderShape->Radius(),
-      cylinderShape->Length(),
-      8, 3, 2,
-      mass
-    );
-  }
-  else if (collGeo->SphereShape()) 
-  {
-    auto sphereShape = collGeo->SphereShape();
-
-    softProperties = dart::dynamics::SoftBodyNodeHelper::makeSphereProperties(
-      sphereShape->Radius(),
-      6, 6,
-      mass
-    );
-  }
-  else if (collGeo->EllipsoidShape())
-  {
-    auto ellipsoidShape = collGeo->EllipsoidShape();
-    Eigen::Vector3d size(
-      ellipsoidShape->Radii().X(),
-      ellipsoidShape->Radii().Y(),
-      ellipsoidShape->Radii().Z()
-      );
-
-    softProperties = dart::dynamics::SoftBodyNodeHelper::makeEllipsoidProperties(
-      size,
-      6, 6,
-      mass
-    );
-  }
-  else 
-  {
-      ignerr << "Geometry of collision element in model ["<< modelInfo.model->getName() 
-        << "] is not supported.\n";
-        return this->GenerateInvalidId(); 
-  }
-
-  softProperties.mKv = collision->Surface()->SoftContact()->BoneAttachement();
-  softProperties.mKe = collision->Surface()->SoftContact()->Stiffness();
-  softProperties.mDampCoeff = collision->Surface()->SoftContact()->Damping();
-
-  dart::dynamics::BodyNode::Properties bodyProperties;
-  bodyProperties.mName = _sdfLink.Name();
-
-
-  dart::dynamics::SoftBodyNode::Properties softbodyProperties(
-    bodyProperties, 
-    softProperties);
-  
-  dart::dynamics::FreeJoint::Properties jointProperties;
-  jointProperties.mName = softbodyProperties.mName + "_FreeJoint";
-
-  const auto result = modelInfo.model->createJointAndBodyNodePair<
-    dart::dynamics::FreeJoint,
-    dart::dynamics::SoftBodyNode>(
-      nullptr, jointProperties, softbodyProperties);
-
-  dart::dynamics::FreeJoint * const joint = result.first;
-  dart::dynamics::SoftBodyNode * const sbn = result.second;
-
-  //Remove inertia from the underlying standard body node class and only
-  //use point mass inertias from soft skin. Do not zero out to avoid singularities
-  dart::dynamics::Inertia inertia;
-  inertia.setMoment(1e-8*Eigen::Matrix3d::Identity());
-  inertia.setMass(1e-8);
-  sbn->setInertia(inertia);
-
-  const Eigen::Isometry3d tf = 
-    GetParentModelFrame(modelInfo) * ResolveSdfPose(_sdfLink.SemanticPose());
-
-  joint->setTransform(tf);
-
-  auto worldID = this->GetWorldOfModelImpl(_modelID);
-  if (worldID == INVALID_ENTITY_ID)
-  {
-    ignerr << "World of model [" << modelInfo.model->getName()
-           << "] could not be found when creating link [" << _sdfLink.Name()
-           << "]\n";
-    return this->GenerateInvalidId();
-  }
-
-  auto world = this->worlds.at(worldID);
-  const std::string fullName = ::sdf::JoinName(
-    world->getName(),
-    ::sdf::JoinName(modelInfo.model->getName(), sbn->getName()));
-  const std::size_t linkID = this->AddLink(sbn, fullName, _modelID);
-  auto linkIdentity = this->GenerateIdentity(linkID, this->links.at(linkID));
-
-  return linkIdentity;
-}
-
-/////////////////////////////////////////////////
 Identity SDFFeatures::ConstructSdfLink(
     const Identity &_modelID,
     const ::sdf::Link &_sdfLink)
 {
-  if (_sdfLink.SoftBody() == true)
-  {
-    gzlog << "Link [" << _sdfLink.Name() << "] is a soft body. \n";
-    return ConstructSdfSoftBodyLink(_modelID, _sdfLink);
-  }
-
   const auto &modelInfo = *this->ReferenceInterface<ModelInfo>(_modelID);
 
-  dart::dynamics::BodyNode::Properties bodyProperties;
-  bodyProperties.mName = _sdfLink.Name();
+  std::shared_ptr<dart::dynamics::BodyNode::Properties> bodyProperties {nullptr};
 
-  const math::Inertiald &sdfInertia = _sdfLink.Inertial();
-  bodyProperties.mInertia.setMass(sdfInertia.MassMatrix().Mass());
+  const Eigen::Isometry3d tf =
+      GetParentModelFrame(modelInfo) * ResolveSdfPose(_sdfLink.SemanticPose());
 
-  const Eigen::Matrix3d I_link = math::eigen3::convert(sdfInertia.Moi());
+  double mass = _sdfLink.Inertial().MassMatrix().Mass();
 
-  bodyProperties.mInertia.setMoment(I_link);
 
-  const Eigen::Vector3d localCom =
-      math::eigen3::convert(sdfInertia.Pose().Pos());
+  //If soft body, create softBodyProteries and replace bodyProperties
+  if (_sdfLink.SoftBody() == true)
+  {
+    dart::dynamics::SoftBodyNode::UniqueProperties softProperties;
+    //We only support 1 collision element when soft body is enabled
+    if (_sdfLink.CollisionCount() > 1) {
+      ignerr << "When parsing soft body for model ["<< modelInfo.model->getName() 
+            << "] only expected 1 collision element, but found " << _sdfLink.CollisionCount() << "\n";
+            return this->GenerateInvalidId(); 
+    }
+    
+    auto coll = _sdfLink.CollisionByIndex(0);
+    auto softContact = coll->Surface()->SoftContact();
+    auto collGeo = coll->Geom();
+    auto transform = _sdfLink.RawPose();
 
-  bodyProperties.mInertia.setLocalCOM(localCom);
+    double skinThickness = 1e-3;
+    double fleshMass = mass * softContact->FleshMassFraction();
+    //Parse shape. Only box, cylinder and ellipsoid is allowed. Throw warning otherwise.
+    if (collGeo->BoxShape())
+    {
+      auto boxShape = collGeo->BoxShape();
+      Eigen::Vector3d size = math::eigen3::convert(boxShape->Size());
+      
+      softProperties = dart::dynamics::SoftBodyNodeHelper::makeBoxProperties(
+        size,
+        Eigen::Isometry3d::Identity(),
+        Eigen::Vector3i(8, 8, 8),
+        fleshMass,
+        softContact->BoneAttachement(),
+        softContact->Stiffness(),
+        softContact->Damping()
+      );
+    } 
+    else 
+    {
+        ignerr << "Geometry of collision element in model ["<< modelInfo.model->getName() 
+          << "] is not supported.\n";
+          return this->GenerateInvalidId(); 
+    }
 
+    softProperties.mKv = softContact->BoneAttachement();
+    softProperties.mKe = softContact->Stiffness();
+    softProperties.mDampCoeff = softContact->Damping();
+
+    //Update mass of underlying bone
+    mass -= fleshMass;
+    
+    //Replace body properties
+    dart::dynamics::BodyNode::AspectProperties properties(_sdfLink.Name());
+    bodyProperties.reset(
+      new dart::dynamics::SoftBodyNode::Properties(
+        properties, softProperties));
+  }
+  else
+  {
+    dart::dynamics::BodyNode::AspectProperties properties(_sdfLink.Name());
+    bodyProperties.reset(new dart::dynamics::BodyNode::Properties(properties));
+  }
 
   dart::dynamics::FreeJoint::Properties jointProperties;
-  jointProperties.mName = bodyProperties.mName + "_FreeJoint";
+  jointProperties.mName = bodyProperties->mName + "_FreeJoint";
   // TODO(MXG): Consider adding a UUID to this joint name in order to avoid any
   // potential (albeit unlikely) name collisions.
 
   // Note: When constructing a link from this function, we always instantiate
   // it as a standalone free body within the model. If it should have any joint
   // constraints, those will be added later.
-  const auto result = modelInfo.model->createJointAndBodyNodePair<
-      dart::dynamics::FreeJoint>(nullptr, jointProperties, bodyProperties);
+  std::pair<dart::dynamics::FreeJoint*, dart::dynamics::BodyNode*> result;
+  if (_sdfLink.SoftBody())
+  {
+    result = modelInfo.model->createJointAndBodyNodePair<
+        dart::dynamics::FreeJoint, dart::dynamics::SoftBodyNode>(
+          nullptr, 
+          jointProperties, 
+          static_cast<const dart::dynamics::SoftBodyNode::Properties&>(*(bodyProperties.get())));
+  }
+  else
+  {
+    result = modelInfo.model->createJointAndBodyNodePair<
+        dart::dynamics::FreeJoint>(nullptr, jointProperties, *(bodyProperties.get()));
+  }
+
 
   dart::dynamics::FreeJoint * const joint = result.first;
-  const Eigen::Isometry3d tf =
-      GetParentModelFrame(modelInfo) * ResolveSdfPose(_sdfLink.SemanticPose());
 
   joint->setTransform(tf);
 
   dart::dynamics::BodyNode * const bn = result.second;
+
+  const math::Inertiald &sdfInertia = _sdfLink.Inertial();
+  Eigen::Matrix3d I_link = math::eigen3::convert(sdfInertia.Moi());
+  const Eigen::Vector3d localCom =
+    math::eigen3::convert(sdfInertia.Pose().Pos());
+  
+  //Set inertia depending on type of body
+  if (_sdfLink.SoftBody())
+  {
+    dart::dynamics::Inertia inertia;
+    inertia.setMoment(1e-8*Eigen::Matrix3d::Identity());
+    inertia.setMass(1e-8);
+    bn->setInertia(inertia);
+  }
+  else
+  {
+    bn->setMass(mass);
+    bn->setMomentOfInertia(
+      I_link(0, 0), I_link(1, 1), I_link(2, 2),
+      I_link(0, 1), I_link(0, 2), I_link(1, 2)
+    );
+    bn->setLocalCOM(localCom);
+  }
 
   auto worldID = this->GetWorldOfModelImpl(_modelID);
   if (worldID == INVALID_ENTITY_ID)
@@ -832,11 +781,53 @@ Identity SDFFeatures::ConstructSdfLink(
     modelFrame->setTransform(tf_frame);
   }
 
-  for (std::size_t i = 0; i < _sdfLink.CollisionCount(); ++i)
+  if (!_sdfLink.SoftBody())
   {
-    const auto collision = _sdfLink.CollisionByIndex(i);
-    if (collision)
-      this->ConstructSdfCollision(linkIdentity, *collision);
+    for (std::size_t i = 0; i < _sdfLink.CollisionCount(); ++i)
+    {
+      const auto collision = _sdfLink.CollisionByIndex(i);
+      if (collision)
+        this->ConstructSdfCollision(linkIdentity, *collision);
+    }
+  }
+  else
+  {
+    auto collision = _sdfLink.CollisionByIndex(0);
+    const std::string internalName =
+        bn->getName() + ":" + collision->Name();
+    if (collision->Geom()->BoxShape())
+    {
+      //Create box that is slightly scaled down
+      auto boxShape = collision->Geom()->BoxShape();
+      Eigen::Vector3d size = math::eigen3::convert(boxShape->Size());
+      size *= 0.6;
+      
+      std::shared_ptr<dart::dynamics::BoxShape> box
+        = std::make_shared<dart::dynamics::BoxShape>(size);
+      
+
+      dart::dynamics::ShapeNode * const node = bn->createShapeNodeWith<
+        dart::dynamics::CollisionAspect, dart::dynamics::DynamicsAspect>(
+          box, internalName);
+      
+      dart::dynamics::Inertia inertia;
+      inertia.setMass(mass);
+      inertia.setMoment(box->computeInertia(inertia.getMass()));
+      bn->setMass(mass);
+      bn->setMomentOfInertia(
+        I_link(0, 0), I_link(1, 1), I_link(2, 2),
+        I_link(0, 1), I_link(0, 2), I_link(1, 2)
+      );
+      bn->setLocalCOM(localCom);
+
+      Eigen::Isometry3d tf_shape = Eigen::Isometry3d::Identity();
+      node->setRelativeTransform(ResolveSdfPose(collision->SemanticPose()) * tf_shape);
+      const std::size_t shapeID =
+        this->AddShape({node, collision->Name(), tf_shape});
+      auto identity = this->GenerateIdentity(shapeID, this->shapes.at(shapeID));
+      uint16_t collideBitmask = 0xFF;
+      this->SetCollisionFilterMask(identity, collideBitmask);  
+    }
   }
 
   // gz-physics is currently ignoring visuals, so we won't parse them from the

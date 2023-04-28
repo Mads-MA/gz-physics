@@ -80,6 +80,7 @@ struct LinkInfo
   /// \brief The total link inertia, which may be split between the `link` and
   /// `weldedNodes` body nodes.
   std::optional<math::Inertiald> inertial;
+  bool softBody = false;
 };
 
 struct JointInfo
